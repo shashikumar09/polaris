@@ -3,6 +3,7 @@ package validator
 
 import (
         "sort"
+	"fmt"
 )
 
 type TopScorers struct {
@@ -21,10 +22,19 @@ type kv struct {
 }
 
 type kvint struct {
-	key string
+	Key string
 	Value int
 }
 
+func (a AuditData) GetUniqueResources()  []string {
+        var totalResources  []string
+        for _, res := range a.Results {
+                if !stringInSlice(res.Name, totalResources) {
+                        totalResources = append(totalResources, res.Name)
+                }
+        }
+        return totalResources
+}
 
 func (a AuditData) GetTopScorers() TopScorers {
 
@@ -54,6 +64,7 @@ func (a AuditData) GetTopNamespacesByScore() []kv {
                 }
                 totalNamespaces[ns] =  uint(totalScore/resourceCount)
         }
+	fmt.Println(totalNamespaces)
         var sortedNamespaces []kv
         for k, v := range totalNamespaces {
                 sortedNamespaces = append(sortedNamespaces, kv{k, v})
@@ -61,6 +72,7 @@ func (a AuditData) GetTopNamespacesByScore() []kv {
         sort.Slice(sortedNamespaces, func(i, j int) bool {
                 return sortedNamespaces[i].Value > sortedNamespaces[j].Value
         })
+	fmt.Println(sortedNamespaces)
         return sortedNamespaces[0:5]
 }
 func sum(array []uint) uint {

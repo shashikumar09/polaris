@@ -107,6 +107,9 @@ type templateData struct {
 	AuditData         validator.AuditData
 	FilteredAuditData validator.AuditData
 	JSON              template.JS
+	TopScorers        template.JS
+	TopWastageCost    template.JS
+        IsFiltered        bool
 }
 
 // GetBaseTemplate puts together the dashboard template. Individual pieces can be overridden before rendering.
@@ -175,14 +178,24 @@ func getConfigForQuery(base config.Configuration, query url.Values) config.Confi
 	return c
 }
 
-func stripUnselectedNamespaces(data *validator.AuditData, selectedNamespaces []string) {
+func stripUnselectedNamespaces(data *validator.AuditData, selectedNamespaces []string, selectedResources []string) {
 	newResults := []validator.Result{}
 	for _, res := range data.Results {
-		if stringInSlice(res.Namespace, selectedNamespaces) {
-			newResults = append(newResults, res)
-		}
-	}
-	var wastageCost int
+		if selectedNamespaces[0] != ""  && selectedResources[0] != "" {
+                        if (stringInSlice(res.Namespace, selectedNamespaces) && stringInSlice(res.Name, selectedResources)) {
+                                newResults = append(newResults, res)
+                        }
+                } else if selectedResources[0] != ""  {
+                        if stringInSlice(res.Name, selectedResources) {
+                                newResults = append(newResults, res)
+                        }
+                } else if selectedNamespaces[0] != "" {
+                        if stringInSlice(res.Namespace, selectedNamespaces) {
+                                newResults = append(newResults, res)
+                        }
+                }
+        }
+    var wastageCost int
     for  namespace, cost := range data.WastageCostOverview.Namespace {
         if stringInSlice(namespace,  selectedNamespaces) {
             wastageCost += cost
@@ -312,19 +325,43 @@ func MainHandler(w http.ResponseWriter, r *http.Request, c config.Configuration,
 	}
 	fmt.Println(auditData.GetTopScorers())
 	fmt.Println(auditData.GetTopWastageCost())
+	topScorers, err := json.Marshal(auditData.GetTopScorers())
+        if err != nil {
+                http.Error(w, "Error serializing audit data", 500)
+                return
+        }
+	topWastageCost, err := json.Marshal(auditData.GetTopWastageCost())
+        if err != nil {
+                http.Error(w, "Error serializing audit data", 500)
+                return
+        }
+	fmt.Println(topWastageCost, topScorers)
 	filteredAuditData := auditData
 	namespaces := r.URL.Query()["ns"]
-	if len(namespaces) > 0 {
-		stripUnselectedNamespaces(&filteredAuditData, namespaces)
-	}
-
+	resources := r.URL.Query()["res"]
+        if len(namespaces) > 0 {
+                namespaces = strings.Split(namespaces[0], ",")
+        }
+        if len(resources) > 0 {
+                resources = strings.Split(resources[0], ",")
+        }
+        fmt.Println("NAMESPACES", namespaces, resources)
+        if len(namespaces) > 0 || len(resources) > 0 {
+                stripUnselectedNamespaces(&filteredAuditData, namespaces, resources)
+        }
 	data := templateData{
 		BasePath:          basePath,
 		AuditData:         auditData,
 		FilteredAuditData: filteredAuditData,
 		JSON:              template.JS(jsonData),
+		TopScorers:        template.JS(topScorers),
+		TopWastageCost:    template.JS(topWastageCost),
 		Config:            c,
 	}
+	if len(namespaces) > 0 || len(resources) > 0 {
+                data.IsFiltered = true
+        }
+	fmt.Println(data.TopWastageCost)
 	tmpl, err := GetBaseTemplate("main")
 	if err != nil {
 		logrus.Printf("Error getting template data %v", err)
