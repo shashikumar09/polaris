@@ -1,0 +1,244 @@
+{{define "dashboard"}}
+  <div id="overview" class="card cluster">
+    <h3>
+      <span>{{ .AuditData.SourceType }} Overview</span>
+{{- if .AuditData.DisplayName -}}
+<small>: {{ .AuditData.DisplayName }}</small>
+{{ end }}
+    </h3>
+    <div class="cluster-overview">
+      <div class="cluster-score">
+        <div class="score-details">
+          <div class="weather"><i class="fas {{ getWeatherIcon .AuditData.GetSummary }}"></i></div>
+          <div class="sailing">{{ getWeatherText .FilteredAuditData.GetSummary }}</div>
+          <div class="scores"><span>Grade: </span><strong>{{ getGrade .FilteredAuditData.GetSummary }}</strong></div>
+          <div class="scores"><span>Score: </span><strong>{{ .FilteredAuditData.GetSummary.GetScore }}%</strong></div>
+          <p class="score-description">
+            Score is the percentage of passing checks. Warnings get half the weight of dangerous checks.
+          </p>
+        </div>
+      </div>
+      <div class="graph">
+        <canvas width="275" height="275" id="clusterScoreChart"></canvas>
+      </div>
+      <div class="result-messages">
+        <ul class="message-list">
+          <li class="success">
+            <i class="message-icon fas fa-check"></i>
+            <div class="message-group">
+              <span class="count"> {{ .FilteredAuditData.GetSummary.Successes }}</span>
+              <span class="message"> passing checks</span>
+            </div>
+          </li>
+          <li class="failure warning">
+            <i class="message-icon fas fa-exclamation"></i>
+            <div class="message-group">
+              <span class="count"> {{ .FilteredAuditData.GetSummary.Warnings }}</span>
+              <span class="message"> warning checks</span>
+            </div>
+          </li>
+          <li class="failure danger">
+            <i class="message-icon fas fa-times"></i>
+            <div class="message-group">
+              <span class="count"> {{ .FilteredAuditData.GetSummary.Dangers }}</span>
+              <span class="message"> dangerous checks</span>
+            </div>
+          </li>
+          <li class="failure danger">
+            <i class="message-icon fas fa-dollar-sign"></i>
+            <div class="message-group">
+              <span class="count"> {{ .FilteredAuditData.WastageCostOverview.FormattedValue }}</span>
+              <span class="message"> Wastage Cost</span>
+            </div>
+          </li>
+        </ul>
+      </div>
+    </div>
+    {{ if and (not .Config.DisallowExemptions) (gt (len .Config.Exemptions) 0) }}
+    <div class="exemption-alert">
+      <i class="fas fa-exclamation"></i>
+      <span>
+        Some checks were skipped based on configured exemptions.
+        <a href="?disallowExemptions=true">Click here</a>
+        to view the report with these checks included.
+      </span>
+    </div>
+    {{ end }}
+    <div class="cluster-overview-footer">
+      <div class="kubernetes-stats">
+          <div class="kubernetes-stat">
+            <span>Kubernetes Version:</span>
+            <strong>{{.FilteredAuditData.ClusterInfo.Version}}</strong>
+          </div>
+          <div class="kubernetes-stat">
+            <span>Nodes:</span>
+            <strong>{{.FilteredAuditData.ClusterInfo.Nodes}}</strong>
+          </div>
+          <div class="kubernetes-stat">
+            <span>Namespaces:</span>
+            <strong>{{.FilteredAuditData.ClusterInfo.Namespaces}}</strong>
+          </div>
+          <div class="kubernetes-stat">
+            <span>Controllers:</span>
+            <strong>{{.FilteredAuditData.ClusterInfo.Controllers}}</strong>
+          </div>
+          <div class="kubernetes-stat">
+            <span>Pods:</span>
+            <strong>{{.FilteredAuditData.ClusterInfo.Pods}}</strong>
+          </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card transparent">
+    <a class="align-self-center"
+        target="_blank"
+        href="https://www.fairwinds.com/polaris-user-insights-demo?utm_source=polaris&utm_medium=ad&utm_campaign=polarisad">
+      <img src="static/images/FW_Insights_Polaris.svg" />
+    </a>
+  </div>
+
+  <div id="categories" class="card category">
+    <h3>Results by Category</h3>
+    <div class="expandable-table">
+      {{ range $category, $summary := .FilteredAuditData.GetSummaryByCategory }}
+        <div class="resource-info">
+          <div class="status-bar">
+            <div class="status">
+              <div class="failing">
+                <div class="warning" style="width: {{ getWarningWidth $summary 200 }}px;">
+                  <div class="passing" style="width: {{ getSuccessWidth $summary 200 }}px;"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="name"><span class="caret-expander"></span>{{ $category }}<span class="category-score">Score: <strong>{{ $summary.GetScore }}%</strong></span></div>
+          <div class="result-messages expandable-content">
+            <p class="category-info">{{ getCategoryInfo $category }} Refer to the <a href="{{ getCategoryLink $category }}" target="_blank">Polaris documentation about {{ $category }}</a> for more information.</p>
+          </div>
+        </div>
+      {{ end }} {{/* end range categories */}}
+    </div>
+  </div>
+
+  <div class="card filters">
+    <div class="resource-info">
+      <div class="name">
+        <span class="caret-expander"></span>
+        <span class="title">Filter by Namespace</span>
+      </div>
+      <div class="result-messages expandable-content">
+        <form id="namespaceFiltersForm" class="namespace-list">
+          {{ range $namespace, $results := .AuditData.GetResultsByNamespace }}
+            <div class="namespace-row">
+              <input type="checkbox" name="{{ $namespace }}" id="namespace-{{ $namespace }}">
+              <label for="namespace-{{ $namespace }}">{{ $namespace }}</label>
+            </div>
+          {{ end }}
+            <input type="submit" value="Apply">
+        </form>
+      </div>
+    </div>
+  </div>
+
+  {{ range $namespace, $results := .FilteredAuditData.GetResultsByNamespace }}
+    <div id="{{ $namespace }}" class="card namespace">
+      {{ if eq $namespace "" }}
+      <h3>Cluster Resources</h3>
+      {{ else }}
+      <h3>Namespace: <strong>{{ $namespace }}</strong> </h3>
+      {{ end }}
+      <div class="expandable-table">
+        {{ range $index, $result := $results }}
+          <div class="resource-info">
+            <div class="status-bar">
+              <div class="status">
+                <div class="failing">
+                  <div class="warning" style="width: {{ getWarningWidth $result.GetSummary 200 }}px;">
+                    <div class="passing" style="width: {{ getSuccessWidth $result.GetSummary 200 }}px;"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="name"><span class="caret-expander"></span>
+              <span class="controller-type">{{ .Kind }}:</span>
+              <strong>{{ .Name }}</strong></div>
+
+              <div class="result-messages expandable-content">
+                <h4>Spec:
+                  {{ if eq 0 (len .Results.GetSortedResults) }}
+                    <i>no checks applied</i>
+                  {{ end }}
+                </h4>
+                <ul class="message-list">
+                  {{ range $message := .Results.GetSortedResults }}
+                    <li class="{{ getResultClass . }}">
+                      <i class="message-icon {{ getIcon $message }}"></i>
+			<span class="message">{{ .Message }}</class>
+                       {{ if eq .ID "WastageCost" }}
+			<a class="more-info" href="{{ getCheckLink .ID  }}" target="_blank">
+                        <i class="far fa-question-circle"></i>
+			 <span class="tooltiptext" style="white-space: pre-line;"> {{ getResourceInfo .Data}} </span>
+		      </a>
+			{{ else }}
+			<a class="more-info" href="{{ getCheckLink .ID }}" target="_blank">
+                        <i class="far fa-question-circle"></i>
+                      </a>
+			{{ end }}
+                    </li>
+                  {{ end }}
+                </ul>
+              </div>
+
+              {{ if .PodResult }}
+                <div class="result-messages expandable-content">
+                  <h4>Pod Spec:
+                    {{ if eq 0 (len .PodResult.Results.GetSortedResults) }}
+                      <i>no checks applied</i>
+                    {{ end }}
+                  </h4>
+                  <ul class="message-list">
+                    {{ range $message := .PodResult.Results.GetSortedResults }}
+                      <li class="{{ getResultClass . }}">
+                        <i class="message-icon {{ getIcon $message }}"></i>
+                        <span class="message">{{ .Message }}</span>
+                        <a class="more-info" href="{{ getCheckLink .ID }}" target="_blank">
+                          <i class="far fa-question-circle"></i>
+                        </a>
+                      </li>
+                    {{ end }}
+                  </ul>
+                </div>
+              {{ end }}
+
+              {{ if .PodResult }}
+                {{ range .PodResult.ContainerResults }}
+                  <div class="result-messages expandable-content">
+                    <h4>Container {{ .Name }}:
+                      {{ if eq 0 (len .Results.GetSortedResults) }}
+                        <i>no checks applied</i>
+                      {{ end }}
+                    </h4>
+                    <ul class="message-list">
+                      {{ range $message := .Results.GetSortedResults }}
+                        <li class="{{ getResultClass . }}">
+                          <i class="message-icon {{ getIcon $message }}"></i>
+                          <span class="message">{{ .Message }}</span>
+                          <a class="more-info" href="{{ getCheckLink .ID }}" target="_blank">
+                            <i class="far fa-question-circle"></i>
+                          </a>
+                        </li>
+                      {{ end }}
+                    </ul>
+                  </div>
+                {{ end }} {{/* end range .PodResult.ContainerResults */}}
+              {{ end }} {{/* end if .PodResult */}}
+            </div>
+        {{ end }} {{/* end range .Results.GetSortedResults */}}
+      </div>
+    </div>
+  {{ end }} {{/* end range .AuditData.GetResultsByNamespace */}}
+  <script src="static/js/charts.js"></script>
+  <script src="static/js/filter.js"></script>
+{{end}}

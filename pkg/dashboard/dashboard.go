@@ -1,0 +1,342 @@
+// Copyright 2019 FairwindsOps Inc
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package dashboard
+
+import (
+	"bytes"
+	"sync"
+	"encoding/json"
+	"html/template"
+	"net/http"
+	"net/url"
+	"path"
+	"strings"
+	"fmt"
+	"time"
+	"os"
+	"github.com/fairwindsops/polaris/pkg/config"
+	"github.com/fairwindsops/polaris/pkg/kube"
+	"github.com/fairwindsops/polaris/pkg/validator"
+	"github.com/fairwindsops/polaris/pkg/arc_constants"
+	"github.com/fairwindsops/polaris/pkg/datadog"
+	packr "github.com/gobuffalo/packr/v2"
+	"github.com/gorilla/mux"
+	"github.com/sirupsen/logrus"
+	"github.com/go-redis/redis"
+)
+
+const (
+	// MainTemplateName is the main template
+	MainTemplateName = "main.gohtml"
+	// HeadTemplateName contains styles and meta info
+	HeadTemplateName = "head.gohtml"
+	// NavbarTemplateName contains the navbar
+	NavbarTemplateName = "navbar.gohtml"
+	// PreambleTemplateName contains an empty preamble that can be overridden
+	PreambleTemplateName = "preamble.gohtml"
+	// DashboardTemplateName contains the content of the dashboard
+	DashboardTemplateName = "dashboard.gohtml"
+	// FooterTemplateName contains the footer
+	FooterTemplateName = "footer.gohtml"
+)
+
+var (
+	templateBox = (*packr.Box)(nil)
+	assetBox    = (*packr.Box)(nil)
+	markdownBox = (*packr.Box)(nil)
+	mutex = &sync.Mutex{}
+)
+
+var myCache *redis.Client
+
+
+func InitRedisCache() {
+	var (
+		host     = getEnv("REDIS_HOST", "localhost")
+		port     = string(getEnv("REDIS_PORT", "6379"))
+		password = getEnv("REDIS_PASSWORD", "")
+	)
+
+ 	myCache = redis.NewClient(&redis.Options{
+                Addr: host + ":" + port,
+                Password: password,
+                DB: 0,
+    })
+
+}
+func getEnv(key, defaultValue string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return defaultValue
+	}
+	return value
+}
+
+// GetAssetBox returns a binary-friendly set of assets packaged from disk
+func GetAssetBox() *packr.Box {
+	if assetBox == (*packr.Box)(nil) {
+		assetBox = packr.New("Assets", "assets")
+	}
+	return assetBox
+}
+
+// GetTemplateBox returns a binary-friendly set of templates for rendering the dash
+func GetTemplateBox() *packr.Box {
+	if templateBox == (*packr.Box)(nil) {
+		templateBox = packr.New("Templates", "templates")
+	}
+	return templateBox
+}
+
+// templateData is passed to the dashboard HTML template
+type templateData struct {
+	BasePath          string
+	Config            config.Configuration
+	AuditData         validator.AuditData
+	FilteredAuditData validator.AuditData
+	JSON              template.JS
+}
+
+// GetBaseTemplate puts together the dashboard template. Individual pieces can be overridden before rendering.
+func GetBaseTemplate(name string) (*template.Template, error) {
+	tmpl := template.New(name).Funcs(template.FuncMap{
+		"getWarningWidth": getWarningWidth,
+		"getSuccessWidth": getSuccessWidth,
+		"getWeatherIcon":  getWeatherIcon,
+		"getWeatherText":  getWeatherText,
+		"getGrade":        getGrade,
+		"getIcon":         getIcon,
+		"getResultClass":  getResultClass,
+		"getCategoryLink": getCategoryLink,
+		"getCategoryInfo": getCategoryInfo,
+		"getCheckLink": getCheckLink,
+		"getResourceInfo": getResourceInfo,
+		"getWastageCostForNamespace": getWastageCostForNamespace,
+	})
+
+	templateFileNames := []string{
+		DashboardTemplateName,
+		HeadTemplateName,
+		NavbarTemplateName,
+		PreambleTemplateName,
+		FooterTemplateName,
+		MainTemplateName,
+	}
+	return parseTemplateFiles(tmpl, templateFileNames)
+}
+
+func parseTemplateFiles(tmpl *template.Template, templateFileNames []string) (*template.Template, error) {
+	templateBox := GetTemplateBox()
+	for _, fname := range templateFileNames {
+		templateFile, err := templateBox.Find(fname)
+		if err != nil {
+			return nil, err
+		}
+
+		tmpl, err = tmpl.Parse(string(templateFile))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return tmpl, nil
+}
+
+func writeTemplate(tmpl *template.Template, data *templateData, w http.ResponseWriter) {
+	buf := &bytes.Buffer{}
+	err := tmpl.Execute(buf, data)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	buf.WriteTo(w)
+}
+
+func getConfigForQuery(base config.Configuration, query url.Values) config.Configuration {
+	c := base
+	exemptions := query.Get("disallowExemptions")
+	if exemptions == "false" {
+		c.DisallowExemptions = false
+	}
+	if exemptions == "true" {
+		c.DisallowExemptions = true
+	}
+	return c
+}
+
+func stripUnselectedNamespaces(data *validator.AuditData, selectedNamespaces []string) {
+	newResults := []validator.Result{}
+	for _, res := range data.Results {
+		if stringInSlice(res.Namespace, selectedNamespaces) {
+			newResults = append(newResults, res)
+		}
+	}
+	var wastageCost int
+    for  namespace, cost := range data.WastageCostOverview.Namespace {
+        if stringInSlice(namespace,  selectedNamespaces) {
+            wastageCost += cost
+        }
+	}
+    data.WastageCostOverview.Value = wastageCost
+    data.WastageCostOverview.FormattedValue = arc_constants.NearestThousandFormat(float64(wastageCost))
+    data.Results = newResults
+}
+
+// GetRouter returns a mux router serving all routes necessary for the dashboard
+func GetRouter(c config.Configuration, auditPath string, port int, basePath string, auditData *validator.AuditData, cacheTime int) *mux.Router {
+	router := mux.NewRouter().PathPrefix(basePath).Subrouter()
+	fileServer := http.FileServer(GetAssetBox())
+	router.PathPrefix("/static/").Handler(http.StripPrefix(path.Join(basePath, "/static/"), fileServer))
+	InitRedisCache()
+	router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("OK"))
+	})
+	router.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		favicon, err := GetAssetBox().Find("favicon-32x32.png")
+		if err != nil {
+			logrus.Errorf("Error getting favicon: %v", err)
+			http.Error(w, "Error getting favicon", http.StatusInternalServerError)
+			return
+		}
+		w.Write(favicon)
+	})
+
+	router.HandleFunc("/results.json", func(w http.ResponseWriter, r *http.Request) {
+		adjustedConf := getConfigForQuery(c, r.URL.Query())
+		
+		k, err := kube.CreateResourceProvider(r.Context(), auditPath, "", c)
+		datadog.InitializeDatadogQueryResponses()
+		if err != nil {
+			logrus.Errorf("Error fetching Kubernetes resources %v", err)
+			http.Error(w, "Error fetching Kubernetes resources", http.StatusInternalServerError)
+			return
+		}
+
+		var auditDataObj validator.AuditData
+		auditDataObj, err = validator.RunAudit(adjustedConf, k)
+		if err != nil {
+			http.Error(w, "Error Fetching Deployments", http.StatusInternalServerError)
+			return
+		}
+		
+		auditData = &auditDataObj
+		if auditData != nil {
+			js, err := json.Marshal(auditData)
+			if err != nil {
+				logrus.Errorf("Error marshaling the AuditData %v", err)
+			}
+			err = myCache.Set("AuditData", js, time.Duration(cacheTime) * time.Minute).Err()
+			if err != nil {
+				logrus.Errorf("Unable to update the cache %v", err)
+			}
+			logrus.Infof("Cache has been updated")
+			JSONHandler(w, r, auditData)
+		}
+	})
+
+	router.HandleFunc("/details/{category}", func(w http.ResponseWriter, r *http.Request) {
+		vars := mux.Vars(r)
+		category := vars["category"]
+		category = strings.Replace(category, ".md", "", -1)
+	})
+	
+	router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" && r.URL.Path != basePath {
+			http.NotFound(w, r)
+			return
+		}
+		adjustedConf := getConfigForQuery(c, r.URL.Query())
+		val := myCache.Get("AuditData")
+		var auditDataCache  *validator.AuditData
+		json.Unmarshal([]byte(val.Val()), &auditDataCache)
+		mutex.Lock()
+		if auditDataCache == nil {
+			mutex.Unlock()
+			mutex.Lock()
+			defer mutex.Unlock()
+			if auditDataCache == nil {
+				k, err := kube.CreateResourceProvider(r.Context(), auditPath, "", c)
+				datadog.InitializeDatadogQueryResponses()
+				if err != nil {
+					logrus.Errorf("Error fetching Kubernetes resources %v", err)
+					http.Error(w, "Error fetching Kubernetes resources", http.StatusInternalServerError)
+					return
+				}
+
+				var auditData validator.AuditData
+				auditData, err = validator.RunAudit(adjustedConf, k)
+				if err != nil {
+					logrus.Errorf("Error getting audit data: %v", err)
+					http.Error(w, "Error running audit", 500)
+					return
+				}
+				js, err := json.Marshal(auditData)
+				if err != nil {
+					fmt.Println(err)
+				}
+
+				err = myCache.Set("AuditData", js, time.Duration(cacheTime) * time.Minute).Err()
+				if err != nil {
+					fmt.Println(err)
+				}
+				fmt.Println("Not using Cache")
+				MainHandler(w, r, adjustedConf, auditData, basePath)
+			} 
+		} else {
+			mutex.Unlock()
+			fmt.Println("Using Cache")
+			MainHandler(w, r, adjustedConf, *auditDataCache, basePath)
+		}
+
+	})
+	return router
+}
+
+// MainHandler gets template data and renders the dashboard with it.
+func MainHandler(w http.ResponseWriter, r *http.Request, c config.Configuration, auditData validator.AuditData, basePath string) {
+	jsonData, err := json.Marshal(auditData.GetSummary())
+	if err != nil {
+		http.Error(w, "Error serializing audit data", 500)
+		return
+	}
+	fmt.Println(auditData.GetTopScorers())
+	fmt.Println(auditData.GetTopWastageCost())
+	filteredAuditData := auditData
+	namespaces := r.URL.Query()["ns"]
+	if len(namespaces) > 0 {
+		stripUnselectedNamespaces(&filteredAuditData, namespaces)
+	}
+
+	data := templateData{
+		BasePath:          basePath,
+		AuditData:         auditData,
+		FilteredAuditData: filteredAuditData,
+		JSON:              template.JS(jsonData),
+		Config:            c,
+	}
+	tmpl, err := GetBaseTemplate("main")
+	if err != nil {
+		logrus.Printf("Error getting template data %v", err)
+		http.Error(w, "Error getting template data", 500)
+		return
+	}
+	writeTemplate(tmpl, &data, w)
+}
+
+// JSONHandler gets template data and renders json with it.
+func JSONHandler(w http.ResponseWriter, r *http.Request, auditData *validator.AuditData) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(auditData)
+}
